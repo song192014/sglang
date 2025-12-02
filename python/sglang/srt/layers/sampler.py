@@ -13,7 +13,14 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
+
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 
 if is_cuda():
     from sgl_kernel import (
@@ -23,6 +30,8 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
+if is_npu():
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -93,42 +102,64 @@ class Sampler(nn.Module):
             # If requested, cache probabilities from original logits before temperature scaling.
             if return_logprob and RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
-
-            # Post process logits
-            logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
-
-            if True:  # Keep this redundant check to simplify some internal code sync
-                if global_server_args_dict["sampling_backend"] == "flashinfer":
-                    if sampling_info.need_min_p_sampling:
-                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                        batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, sampling_info.min_ps
-                        )
-                    else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
+            
+            if global_server_args_dict["sampling_backend"] == "vllm_ascend":
+                logits = logits.to(torch.float)
+                logits.div_(sampling_info.temperature.to(torch.bfloat16))
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_vllm_ascend(
+                    logits,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                )
+            elif global_server_args_dict["sampling_backend"] == "ascend":
+                logits.div_(sampling_info.temperature)
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
+                    logits,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                )
+            else:
+                # Post process logits
+                logits.div_(sampling_info.temperatures)
+                logits[:] = torch.softmax(logits, dim=-1)
+                probs = logits
+                del logits
+            
+                if True:  # Keep this redundant check to simplify some internal code sync
+                    if global_server_args_dict["sampling_backend"] == "flashinfer":
+                        if sampling_info.need_min_p_sampling:
+                            probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                            batch_next_token_ids = min_p_sampling_from_probs(
+                                probs, sampling_info.min_ps
+                            )
+                        else:
+                            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                filter_apply_order="joint",
+                                check_nan=self.use_nan_detection,
+                            )
+                    elif global_server_args_dict["sampling_backend"] == "pytorch":
+                        # A slower fallback implementation with torch native operations.
+                        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                            probs,
                             sampling_info.top_ks,
                             sampling_info.top_ps,
-                            filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                            sampling_info.sampling_seed,
+                            positions,
                         )
-                elif global_server_args_dict["sampling_backend"] == "pytorch":
-                    # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
-                    )
+                    else:
+                        raise ValueError(
+                            f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
+                        )
 
             if return_logprob:
                 # clamp to avoid -inf
@@ -223,6 +254,100 @@ class Sampler(nn.Module):
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
 
+def top_k_top_p_min_p_sampling_from_logits_vllm_ascend(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+
+    ##### handle top_k #####
+    # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
+    top_ks[top_ks == TOP_K_ALL] = logits.shape[1]
+    top_k_mask = logits_sort.size(1) - top_ks.to(torch.long)
+    # Get all the top_k values.
+    top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+    top_k_mask = logits_sort < top_k_mask
+    logits_sort.masked_fill_(top_k_mask, -float("inf"))
+
+    ##### handle top_p #####
+    probs_sort = logits_sort.softmax(dim=-1)
+    probs_idx = logits_idx
+    probs_sum = probs_sort.cumsum(dim=-1)
+
+    # top_p_mask = probs_sum <= 1 - top_ps.unsqueeze(dim=1)
+    top_p_mask = probs_sum <= 1 - top_ps.to(torch.bfloat16).unsqueeze(dim=1)
+
+    # at least one
+    top_p_mask[:, -1] = False
+    logits_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    if need_min_p_sampling:
+        assert NotImplementedError("min_p_sampling not implemented")
+
+    probs_sort = torch.softmax(logits_sort, dim=-1, dtype=torch.float)
+
+    ##### handle random sample #####
+    # sampled_index = torch.multinomial(probs_sort, num_samples=1)
+
+    q = torch.empty_like(probs_sort)
+    q.exponential_()
+    sampled_index = probs_sort.div_(q).argmax(dim=-1, keepdim=True)
+
+    # int32 range is enough to represent the token ids
+    probs_idx = probs_idx.to(torch.int32)
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+
+    return batch_next_token_ids
+
+
+def top_k_top_p_min_p_sampling_from_logits_ascend(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    if False: # if hasattr(torch_npu, 'npu_top_k_top_p') and torch.all((top_ks >= 1) & (top_ks <= 1024)):
+        # probs = torch.softmax(logits, dim=-1)
+        logits = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
+        # batch_next_token_ids = torch.multinomial(logits.exp(), num_samples=1).view(-1)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        q = torch.empty_like(probs)
+        q.exponential_()
+        batch_next_token_ids = probs.div_(q).argmax(dim=-1).view(-1)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+        ##### handle top_k #####
+        # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
+        top_ks[top_ks == TOP_K_ALL] = probs.shape[1]
+        elements_to_discard = torch.arange(
+            0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks.unsqueeze(dim=1)
+        probs_sort.masked_fill_(elements_to_discard, 0.0)
+
+        ##### handle top_p #####
+        cumprob = torch.cumsum(probs_sort, dim=-1)
+        top_p_mask = cumprob - probs_sort > top_ps.unsqueeze(dim=1)
+        probs_sort.masked_fill_(top_p_mask, 0.0)
+
+        ##### handle min_p #####
+        if need_min_p_sampling:
+            min_p_thresholds = probs_sort[:, 0] * min_ps
+            min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
+            probs_sort.masked_fill_(min_p_mask, 0.0)
+
+        ##### handle random sample #####
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+
+        # int32 range is enough to represent the token ids
+        probs_idx = probs_idx.to(torch.int32)
+        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+
+    return batch_next_token_ids, probs
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,

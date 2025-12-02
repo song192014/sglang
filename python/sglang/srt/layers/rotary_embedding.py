@@ -165,6 +165,70 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+    
+    def forward_npu_apply_rotary_emb(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query_shape, key_shape = query.shape, key.shape
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        last_dim = cos_sin.size()[-1]
+        cos, sin = cos_sin.reshape(-1, 2, last_dim // 2).repeat(
+            1, 1, 2).chunk(2, dim=-2)
+        # BSNH
+        self.cos = cos.view(1, -1, 1, last_dim).contiguous()
+        self.sin = sin.view(1, -1, 1, last_dim).contiguous()
+        if offsets is not None:
+            raise NotImplementedError(
+                "Batched rotary embedding is currently not supported on NPU.")
+        else:
+            if self.cos is not None and \
+                self.sin is not None:
+                # If cos and sin are generated outside, use npu_apply_rotary_pos_emb to avoid redundant calculation.
+                # This method requires head_size and rotary_dim equal 128 and neox_style is True
+                query = query.contiguous().view(1, query.shape[0], -1,
+                                                self.head_size)
+                key = key.contiguous().view(1, key.shape[0], -1, self.head_size)
+                torch_npu.npu_apply_rotary_pos_emb(query, key, self.cos, self.sin)
+            elif self.rotary_dim < self.head_size:
+                num_tokens = query.shape[0]
+                query = query.view(num_tokens, -1, self.head_size)
+                key = key.view(num_tokens, -1, self.head_size)
+                q_rot = query[..., :self.rotary_dim]
+                q_pass = query[..., self.rotary_dim:]
+                k_rot = key[..., :self.rotary_dim]
+                k_pass = key[..., self.rotary_dim:]
+                q_rot = q_rot.contiguous().view(num_tokens, -1)
+                k_rot = k_rot.contiguous().view(num_tokens, -1)
+                torch_npu._npu_rotary_embedding(
+                    positions,
+                    q_rot,
+                    k_rot,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
+                q_rot = q_rot.view(num_tokens, -1, self.rotary_dim)
+                k_rot = k_rot.view(num_tokens, -1, self.rotary_dim)
+                q = torch.cat((q_rot, q_pass), dim=-1).reshape(query_shape)
+                k = torch.cat((k_rot, k_pass), dim=-1).reshape(key_shape)
+                return q, k
+            else:
+                # TODO: Remove the contiguous in the future.
+                query = query.contiguous().view(query.shape[0], -1)
+                key = key.contiguous().view(key.shape[0], -1)
+                torch_npu._npu_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
+            return query.view(query_shape), key.view(key_shape)
 
     def forward_npu(
         self,
@@ -175,6 +239,8 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
         import os
+
+        return self.forward_npu_apply_rotary_emb(positions, query, key, offsets)
 
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
             return self.forward_native(positions, query, key, offsets)
