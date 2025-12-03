@@ -45,7 +45,7 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.use_mla = model_runner.model_config.attention_arch = AttentionArch
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()

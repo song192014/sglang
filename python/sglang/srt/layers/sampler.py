@@ -108,7 +108,7 @@ class Sampler(nn.Module):
             
             if global_server_args_dict["sampling_backend"] == "vllm_ascend":
                 logits = logits.to(torch.float)
-                logits.div_(sampling_info.temperature.to(torch.bfloat16))
+                logits.div_(sampling_info.temperatures.to(torch.bfloat16))
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_vllm_ascend(
                     logits,
                     sampling_info.top_ks,
@@ -117,8 +117,8 @@ class Sampler(nn.Module):
                     sampling_info.need_min_p_sampling,
                 )
             elif global_server_args_dict["sampling_backend"] == "ascend":
-                logits.div_(sampling_info.temperature)
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
+                logits.div_(sampling_info.temperatures)
+                batch_next_token_ids, probs = top_k_top_p_min_p_sampling_from_logits_ascend(
                     logits,
                     sampling_info.top_ks,
                     sampling_info.top_ps,
@@ -314,7 +314,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
 ):
-    if False: # if hasattr(torch_npu, 'npu_top_k_top_p') and torch.all((top_ks >= 1) & (top_ks <= 1024)):
+    if hasattr(torch_npu, 'npu_top_k_top_p') and torch.all((top_ks >= 1) & (top_ks <= 1024)):
         # probs = torch.softmax(logits, dim=-1)
         logits = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         # batch_next_token_ids = torch.multinomial(logits.exp(), num_samples=1).view(-1)

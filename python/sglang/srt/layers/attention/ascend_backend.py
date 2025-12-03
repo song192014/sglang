@@ -223,7 +223,7 @@ class AscendAttnBackend(AttentionBackend):
                         dtype=query.dtype,
                         device=query.device,
                     )
-
+                    '''
                     torch_npu._npu_flash_attention_qlens(
                         query=query,
                         key_cache=k_cache,
@@ -237,6 +237,21 @@ class AscendAttnBackend(AttentionBackend):
                         num_kv_heads=layer.tp_k_head_num,
                         out=attn_output,
                     )
+                    '''
+                    query_shape = query.shape
+                    query = query.reshape(query_shape[0], layer.tp_q_head_num, -1)
+                    attn_output = attn_output.reshape(query_shape[0], layer.tp_q_head_num, -1)
+                    self.gen_attention_mask(query_shape[0], dtype=torch.bfloat16)
+                    torch_npu._npu_flash_attention(query=query,
+                        key=k,
+                        value=v,
+                        mask=self.mask,
+                        seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
+                        scale_value=layer.scaling,
+                        num_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        out=attn_output)
+                    attn_output = attn_output.view(query.shape[0], -1)
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
