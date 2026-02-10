@@ -938,16 +938,37 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        torch_npu._npu_reshape_and_cache(
-            key=cache_k,
-            value=cache_v,
-            key_cache=self.k_buffer[layer_id].view(
+        # torch_npu._npu_reshape_and_cache(
+        #     key=cache_k,
+        #     value=cache_v,
+        #     key_cache=self.k_buffer[layer_id].view(
+        #         -1, self.page_size, self.head_num, self.head_dim
+        #     ),
+        #     value_cache=self.v_buffer[layer_id].view(
+        #         -1, self.page_size, self.head_num, self.head_dim
+        #     ),
+        #     slot_indices=loc,
+        # )
+
+        # modify fro fp32
+        tokens_num = loc.shape[0]
+        first = loc // self.page_size
+        second = loc % self.page_size
+        offset_tensors = torch.stack([first, second], dim=1).to("npu")
+
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_id].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
-            value_cache=self.v_buffer[layer_id].view(
+            offset_tensors,
+            cache_k,
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_id].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
-            slot_indices=loc,
+            offset_tensors,
+            cache_v,
         )
 
 

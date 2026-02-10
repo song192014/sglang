@@ -23,6 +23,50 @@ import os
 
 import numpy as np
 
+def paged_attention(
+    query: torch.Tensor, # [batch_size, num_heads, seq_len, head_dim]
+    key_cache: torch.Tensor, # [num_blocks, block_size, num_heads, head_dim]
+    value_cache: torch.Tensor, # [num_blocks, block_size, num_heads, head_dim]
+    num_heads: int,
+    num_kv_heads: int,
+    scale_value: float,
+    block_tables: torch.Tensor, # [batch_size, max_blocks_per_seq]
+    context_lens: torch.Tensor, # [batch_size] 每个序列的实际长度
+    attn_out: torch.Tensor,
+):
+    batch_size, q_head_num, q_head_dim = query.shape
+    block_num, page_size, kv_head_num, kv_head_dim = key_cache.shape
+
+    for batch_id in range(batch_size):
+        # Obtain the block table of the current seq.
+        block_table = block_tables[batch_id]
+        context_len = context_lens[batch_id].item()
+
+        # collect kv_cache block
+        k_blocks = []
+        v_blocks = []
+
+        for block_id in block_table:
+            k_blocks.append(key_cache[block_id])
+            v_blocks.append(value_cache[block_id])
+
+        if k_blocks:
+            # cat all kv_blocks
+            K = torch.cat(k_blocks, dim=0)[:context_len] #[actual_len, num_heads, head_dim]
+            V = torch.cat(v_blocks, dim=0)[:context_len] #[actual_len, num_heads, head_dim]
+
+            # transpose
+            K = K.transpose(0, 1) # [num_heads, actual_len, head_dim]
+            V = V.transpose(0, 1) # [num_heads, actual_len, head_dim]
+
+            Q = query[batch_id]  # [num_heads, seq_len, head_dim]
+            attn_scores = torch.matmul(Q, K.transpose(-2, -1)) # [num_heads, seq_len, actual_len]
+            attn_scores = attn_scores * scale_value
+
+            weights = torch.softmax(attn_scores, dim=-1)
+            out = torch.matmul(weights, V)
+            attn_out[batch_id] = out
+
 
 @dataclass
 class ForwardMetadata:
@@ -240,7 +284,11 @@ class AscendAttnBackend(AttentionBackend):
                     query_shape = query.shape
                     query = query.reshape(query_shape[0], layer.tp_q_head_num, -1)
                     attn_output = attn_output.reshape(query_shape[0], layer.tp_q_head_num, -1)
-                    self.gen_attention_mask(query_shape[0], dtype=torch.bfloat16)
+                    self.gen_attention_mask(query_shape[0], dtype=torch.float16)
+                    query = query.to(torch.float16)
+                    k = k.to(torch.float16)
+                    v = v.to(torch.float16)
+                    attn_output = attn_output.to(torch.float16)
                     torch_npu._npu_flash_attention(query=query,
                         key=k,
                         value=v,
@@ -250,6 +298,7 @@ class AscendAttnBackend(AttentionBackend):
                         num_heads=layer.tp_q_head_num,
                         num_kv_heads=layer.tp_k_head_num,
                         out=attn_output)
+                    attn_output = attn_output.to(torch.float)
                     attn_output = attn_output.view(query.shape[0], -1)
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
@@ -404,6 +453,12 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
 
+            # modify fro fp32
+            query = query.to(torch.float16)
+            k_cache = k_cache.to(torch.float16)
+            v_cache = v_cache.to(torch.float16)
+            attn_output = attn_output.to(torch.float16)
+
             torch_npu._npu_paged_attention(
                 query=query,
                 key_cache=k_cache,
@@ -414,6 +469,9 @@ class AscendAttnBackend(AttentionBackend):
                 block_table=self.forward_metadata.block_tables,
                 context_lens=actual_seq_len_kv,
                 out=attn_output)
+
+            # modify for fp32
+            attn_output = attn_output.to(torch.float)
 
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
@@ -539,6 +597,24 @@ class AscendAttnBackend(AttentionBackend):
                     device=query.device,
                 )
 
+                # paged_attention(
+                #     query=query,
+                #     key_cache=k_cache,
+                #     value_cache=v_cache,
+                #     num_heads=layer.tp_q_head_num,
+                #     num_kv_heads=layer.tp_k_head_num,
+                #     scale_value=layer.scaling,
+                #     block_tables=self.forward_metadata.block_tables,
+                #     context_lens=self.forward_metadata.seq_lens_cpu_int,
+                #     attn_out=attn_output,
+                # )
+
+                # modify fro fp32
+                query = query.to(torch.float16)
+                k_cache = k_cache.to(torch.float16)
+                v_cache = v_cache.to(torch.float16)
+                attn_output = attn_output.to(torch.float16)
+
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,
@@ -550,6 +626,9 @@ class AscendAttnBackend(AttentionBackend):
                     context_lens=self.forward_metadata.seq_lens_cpu_int,
                     out=attn_output,
                 )
+            
+                # modify for fp32
+                attn_output = attn_output.to(torch.float)
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if save_kv_cache:
